@@ -456,8 +456,6 @@ class DdpTab(ttk.Frame):
 
         header = ttk.Frame(self)
         header.pack(fill="x", pady=(0, 6))
-        self.title_lbl = ttk.Label(header, text=title, font=("Segoe UI", 9, "bold"))
-        self.title_lbl.pack(side="left", padx=(0, 16))
         ttk.Label(header, text="Дисков в группе:").pack(side="left")
         ttk.Spinbox(
             header,
@@ -655,7 +653,7 @@ class DdpTab(ttk.Frame):
             text=(
                 f"занято сырого: {format_tb(used)} ТБ из {format_tb(total)} ТБ   |   "
                 f"осталось: {format_tb(remain)} ТБ   |   "
-                f"полезно: {format_tb(usable)} ТБ   |   чётность: {format_tb(parity)} ТБ"
+                f"полезная нагрузка: {format_tb(usable)} ТБ   |   чётность: {format_tb(parity)} ТБ"
             )
         )
 
@@ -727,9 +725,9 @@ def build_html_report(app: "RaidPlannerApp") -> str:
         sections.append(
             f"<section><h2>{html.escape(tab.title)}</h2>"
             f"<p>Дисков: {n}. Занято сырого: {format_gb_tb(used_raw)}. "
-            f"Полезно: {format_gb_tb(tab._last_usable)}. Чётность: {format_gb_tb(tab._last_parity)}.</p>"
+            f"Полезная нагрузка: {format_gb_tb(tab._last_usable)}. Чётность: {format_gb_tb(tab._last_parity)}.</p>"
             "<table><thead><tr><th>LUN</th><th>RAID</th><th>Дисков</th>"
-            "<th>Полезно</th><th>Страйп</th><th>Данные / чётность</th></tr></thead><tbody>"
+            "<th>Полезная нагрузка</th><th>Страйп</th><th>Данные / чётность</th></tr></thead><tbody>"
             + ("".join(lun_rows) if lun_rows else "<tr><td colspan='6'>Нет LUN-ов</td></tr>")
             + "</tbody></table>"
             "<div class='disks'>" + "".join(disk_rows) + "</div></section>"
@@ -779,7 +777,7 @@ def build_html_report(app: "RaidPlannerApp") -> str:
 <p class="meta">{html.escape(stamp)}</p>
 <p>Пул: {count} × {tb:g} ТБ = {format_gb_tb(pool_bytes)} ({format_bytes(pool_bytes)} Б).
 В группах: {used_disks} диск(ов), свободно: {remaining_disks}.
-Суммарно полезно: {format_gb_tb(total_usable)}, чётность: {format_gb_tb(total_parity)}.</p>
+Суммарно полезная нагрузка: {format_gb_tb(total_usable)}, чётность: {format_gb_tb(total_parity)}.</p>
 {body}
 <p class="hint">Чтобы получить PDF: в браузере Печать → «Сохранить как PDF».</p>
 </body>
@@ -857,6 +855,13 @@ class RaidPlannerApp(ttk.Frame):
         ttk.Button(toolbar, text="Отчёт…", command=self.export_report).pack(side="left")
         ttk.Label(toolbar, text="HTML, из браузера можно сохранить в PDF").pack(side="left", padx=(6, 0))
 
+        totals = ttk.Frame(box)
+        totals.pack(fill="x", pady=(0, 6))
+        self.total_usable_lbl = ttk.Label(totals, text="Суммарно полезная нагрузка (под LUN): —")
+        self.total_usable_lbl.pack(anchor="w")
+        self.total_parity_lbl = ttk.Label(totals, text="Суммарно под чётность: —")
+        self.total_parity_lbl.pack(anchor="w")
+
         try:
             style = ttk.Style()
             style.configure("TNotebook.Tab", font=("Segoe UI", 9, "bold"))
@@ -868,12 +873,6 @@ class RaidPlannerApp(ttk.Frame):
     def _build_status(self) -> None:
         self.warn_lbl = ttk.Label(self, text="", foreground="red")
         self.warn_lbl.pack(fill="x", pady=(8, 0))
-        totals = ttk.Frame(self)
-        totals.pack(fill="x", pady=(4, 0))
-        self.total_usable_lbl = ttk.Label(totals, text="Суммарно полезно (под LUN): —")
-        self.total_usable_lbl.pack(anchor="w")
-        self.total_parity_lbl = ttk.Label(totals, text="Суммарно под чётность: —")
-        self.total_parity_lbl.pack(anchor="w")
 
     def add_group(self) -> None:
         title = f"DDP{len(self.tabs) + 1}"
@@ -897,7 +896,6 @@ class RaidPlannerApp(ttk.Frame):
         widget.destroy()
         for i, tab in enumerate(self.tabs):
             tab.title = f"DDP{i + 1}"
-            tab.title_lbl.configure(text=tab.title)
             self.notebook.tab(tab, text=tab.title)
         self.refresh()
 
@@ -977,7 +975,7 @@ class RaidPlannerApp(ttk.Frame):
         self.warn_lbl.configure(text="  |  ".join(warnings) if warnings else "")
         self.total_usable_lbl.configure(
             text=(
-                f"Суммарно полезно (под LUN): {format_tb(total_usable)} ТБ  "
+                f"Суммарно полезная нагрузка (под LUN): {format_tb(total_usable)} ТБ  "
                 f"({format_bytes(total_usable)} Б)"
             )
         )
