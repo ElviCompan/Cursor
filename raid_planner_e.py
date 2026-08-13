@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Планировщик DDP: группы дисков и LUN-ы, размазанные по дискам согласно RAID."""
+"""Планировщик DDP (Extended): плюс RAID-6p и RAID-60."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ LUN_PALETTE = (
     "#65a30d",
 )
 
-RAID_TYPES = ("0", "1", "5", "6", "10")
+RAID_TYPES = ("0", "1", "5", "6", "6p", "10", "60")
 
 
 def tb_to_bytes(tb: float) -> int:
@@ -77,10 +77,12 @@ def min_width(raid_type: str) -> int:
         return 2
     if rt == "5":
         return 3
-    if rt == "6":
+    if rt in ("6", "6p"):
         return 4
     if rt == "10":
         return 4
+    if rt == "60":
+        return 8
     return 2
 
 
@@ -92,18 +94,20 @@ def suggest_width(raid_type: str) -> int:
         return 2
     if rt == "5":
         return 4
-    if rt == "6":
+    if rt in ("6", "6p"):
         return 6
     if rt == "10":
         return 4
+    if rt == "60":
+        return 8
     return 2
 
 
 def normalize_width(raid_type: str, width: int) -> int:
-    """Минимальная ширина; RAID-10 — чётное число дисков."""
+    """Минимальная ширина; RAID-10/60 — чётное число дисков."""
     rt = str(raid_type).strip().lower()
     w = max(min_width(rt), width)
-    if rt == "10" and w % 2:
+    if rt in ("10", "60") and w % 2:
         w += 1
     if rt == "1":
         w = 2
@@ -119,8 +123,11 @@ def data_disks(raid_type: str, width: int) -> int:
         return w // 2
     if rt == "5":
         return max(0, w - 1)
-    if rt == "6":
+    if rt in ("6", "6p"):
         return max(0, w - 2)
+    if rt == "60":
+        # два RAID-6, склеенных страйпом: 4 диска под P+Q
+        return max(0, w - 4)
     return w
 
 
@@ -140,7 +147,7 @@ def usable_from_extent(extent: int, raid_type: str, width: int) -> int:
 
 
 def parity_kind(raid_type: str, index_in_stripe: int, width: int) -> str:
-    """Метка куска: '' данные, 'P' чётность/зеркало."""
+    """Метка куска: '' данные, 'P' чётность/зеркало, 'Q' вторая чётность."""
     rt = str(raid_type).strip().lower()
     if rt == "0":
         return ""
@@ -150,6 +157,22 @@ def parity_kind(raid_type: str, index_in_stripe: int, width: int) -> str:
         return "P" if index_in_stripe >= width - 1 else ""
     if rt == "6":
         return "P" if index_in_stripe >= width - 2 else ""
+    if rt == "6p":
+        if index_in_stripe == width - 2:
+            return "P"
+        if index_in_stripe == width - 1:
+            return "Q"
+        return ""
+    if rt == "60":
+        half = width // 2
+        if half < 4:
+            return ""
+        local = index_in_stripe % half
+        if local == half - 2:
+            return "P"
+        if local == half - 1:
+            return "Q"
+        return ""
     return ""
 
 
@@ -174,6 +197,8 @@ def max_extent(free: list[int], width: int) -> int:
 def stipple_for(kind: str) -> str:
     if kind == "P":
         return "gray50"
+    if kind == "Q":
+        return "gray25"
     return ""
 
 
@@ -241,30 +266,30 @@ class LunRow:
         parent.columnconfigure(0, weight=1)
 
         col = 0
-        self.lbl_name = ttk.Label(self.frame, text=f"LUN{index + 1}")
-        self.lbl_name.grid(row=0, column=col, sticky="w", padx=(0, 6))
-        col += 1
-
         self.swatch = tk.Canvas(self.frame, width=16, height=16, highlightthickness=1, highlightbackground="#444")
-        self.swatch.grid(row=0, column=col, padx=(0, 8), sticky="w")
+        self.swatch.grid(row=0, column=col, padx=(0, 6))
         self.swatch.create_rectangle(0, 0, 16, 16, fill=self.color, outline="")
         col += 1
 
-        ttk.Label(self.frame, text="RAID:").grid(row=0, column=col, sticky="w")
+        self.lbl_name = ttk.Label(self.frame, text=f"LUN{index + 1}", width=6)
+        self.lbl_name.grid(row=0, column=col, padx=(0, 8))
+        col += 1
+
+        ttk.Label(self.frame, text="RAID:").grid(row=0, column=col, sticky="e")
         col += 1
         self.raid_var = tk.StringVar(value="0")
         self.raid_combo = ttk.Combobox(
             self.frame,
             textvariable=self.raid_var,
             values=RAID_TYPES,
-            width=4,
+            width=5,
             state="readonly",
         )
-        self.raid_combo.grid(row=0, column=col, padx=(4, 8), sticky="w")
+        self.raid_combo.grid(row=0, column=col, padx=(4, 10))
         col += 1
         self.raid_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_raid_change())
 
-        ttk.Label(self.frame, text="дисков:").grid(row=0, column=col, sticky="w")
+        ttk.Label(self.frame, text="дисков:").grid(row=0, column=col, sticky="e")
         col += 1
         self.width_var = tk.StringVar(value="2")
         self.width_spin = ttk.Spinbox(
@@ -275,37 +300,20 @@ class LunRow:
             textvariable=self.width_var,
             command=self._on_width_change,
         )
-        self.width_spin.grid(row=0, column=col, padx=(4, 8), sticky="w")
+        self.width_spin.grid(row=0, column=col, padx=(4, 10))
         col += 1
         self.width_var.trace_add("write", lambda *_: self._on_width_change())
 
-        self.size_lbl = ttk.Label(self.frame, text="0 ГБ")
-        self.size_lbl.grid(row=0, column=col, sticky="w", padx=(0, 10))
+        self.size_lbl = ttk.Label(self.frame, text="0 ГБ", width=36)
+        self.size_lbl.grid(row=0, column=col, sticky="w")
         col += 1
 
-        try:
-            free_bg = ttk.Style().lookup("TFrame", "background") or "SystemButtonFace"
-        except tk.TclError:
-            free_bg = "SystemButtonFace"
-        self.free_lbl = tk.Label(
-            self.frame,
-            text="ещё 0 ТБ",
-            fg="#15803d",
-            bg=free_bg,
-            font=("Segoe UI", 9),
-        )
-        self.free_lbl.grid(row=0, column=col, sticky="w", padx=(0, 8))
-        col += 1
-
-        self.warn_lbl = ttk.Label(self.frame, text="", foreground="darkorange")
-        self.warn_lbl.grid(row=0, column=col, sticky="w", padx=(0, 4))
-        col += 1
-
-        self.frame.columnconfigure(col, weight=1)
+        self.warn_lbl = ttk.Label(self.frame, text="", foreground="darkorange", width=28)
+        self.warn_lbl.grid(row=0, column=col, sticky="w", padx=(4, 4))
         col += 1
 
         ttk.Button(self.frame, text="−", width=3, command=lambda: self.on_remove(self)).grid(
-            row=0, column=col, padx=(8, 0), sticky="e"
+            row=0, column=col, padx=(8, 0)
         )
 
         self.size_var = tk.DoubleVar(value=0.0)
@@ -327,7 +335,8 @@ class LunRow:
             relief=tk.FLAT,
             command=lambda *_: self._on_slider(),
         )
-        self.scale.grid(row=1, column=0, columnspan=col + 1, sticky="ew", padx=(0, 8), pady=(0, 4))
+        self.scale.grid(row=1, column=0, columnspan=col + 1, sticky="ew", padx=(22, 8), pady=(0, 4))
+        self.frame.columnconfigure(0, weight=1)
 
     def set_index(self, index: int) -> None:
         self.color = LUN_PALETTE[index % len(LUN_PALETTE)]
@@ -382,8 +391,6 @@ class LunRow:
         self.size_lbl.configure(
             text=f"{format_gb(usable)} ГБ  ({format_tb(usable)} ТБ)  ×{n_data} по {format_tb(ext)} ТБ"
         )
-        remain = max(0, int(self._max_gb * GB) - usable)
-        self.free_lbl.configure(text=f"ещё {format_tb(remain)} ТБ")
 
     def set_warning(self, text: str) -> None:
         self.warn_lbl.configure(text=text)
@@ -476,7 +483,10 @@ class DdpTab(ttk.Frame):
         disk_wrap.pack(fill="both", expand=True)
         legend = ttk.Label(
             disk_wrap,
-            text="Сплошной цвет — данные LUN. Штриховка и «P» — чётность/зеркало того же LUN. Серое — свободно.",
+            text=(
+                "Сплошной цвет — данные LUN. «P» / серая штриховка — чётность или зеркало. "
+                "«Q» / более частая штриховка — вторая чётность (RAID-6p и RAID-60). Серое — свободно."
+            ),
         )
         legend.pack(anchor="w", pady=(0, 4))
 
@@ -642,12 +652,9 @@ class DdpTab(ttk.Frame):
 
     def set_group_info(self, used: int, usable: int, parity: int) -> None:
         n = self.disk_count()
-        total = n * self.app.disk_bytes()
-        remain = max(0, total - used)
         self.group_info_lbl.configure(
             text=(
-                f"занято сырого: {format_tb(used)} ТБ из {format_tb(total)} ТБ   |   "
-                f"осталось: {format_tb(remain)} ТБ   |   "
+                f"занято сырого: {format_tb(used)} ТБ из {format_tb(n * self.app.disk_bytes())} ТБ   |   "
                 f"полезно: {format_tb(usable)} ТБ   |   чётность: {format_tb(parity)} ТБ"
             )
         )
@@ -750,6 +757,7 @@ def build_html_report(app: "RaidPlannerApp") -> str:
          display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; }}
   .seg.free {{ background: #e5e7eb; }}
   .parity-p {{ background-image: repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,.4) 3px, rgba(255,255,255,.4) 6px); }}
+  .parity-q {{ background-image: repeating-linear-gradient(-45deg, transparent, transparent 2px, rgba(0,0,0,.28) 2px, rgba(0,0,0,.28) 4px); }}
   .hint {{ margin-top: 32px; color: #64748b; font-size: 13px; }}
   @media print {{
     body {{ margin: 12px; }}
@@ -968,7 +976,7 @@ class RaidPlannerApp(ttk.Frame):
 
 def main() -> None:
     root = tk.Tk()
-    root.title("DDP / LUN — планировщик")
+    root.title("DDP / LUN — планировщик (Extended)")
     root.geometry("1280x780")
     root.minsize(960, 560)
 
