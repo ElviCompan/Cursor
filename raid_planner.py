@@ -467,18 +467,9 @@ class DdpTab(ttk.Frame):
         self.group_info_lbl = ttk.Label(header, text="")
         self.group_info_lbl.pack(side="left")
 
-        lun_wrap = ttk.LabelFrame(self, text="LUN-ы", padding=6)
-        lun_wrap.pack(fill="x", pady=(0, 8))
-        toolbar = ttk.Frame(lun_wrap)
-        toolbar.pack(fill="x", pady=(0, 4))
-        ttk.Button(toolbar, text="+", width=3, command=self.add_lun).pack(side="left")
-        ttk.Label(toolbar, text="Добавить LUN").pack(side="left", padx=(6, 0))
-
-        self.luns_frame = ttk.Frame(lun_wrap)
-        self.luns_frame.pack(fill="x")
-
+        # Карта дисков снизу: pack первым, чтобы LUN-ы не вытесняли её за край окна.
         disk_wrap = ttk.LabelFrame(self, text="Диски группы (нумерация по порядку)", padding=6)
-        disk_wrap.pack(fill="both", expand=True)
+        disk_wrap.pack(side="bottom", fill="both", expand=True)
         legend = ttk.Label(
             disk_wrap,
             text="Сплошной цвет — данные LUN. Штриховка и «P» — чётность/зеркало того же LUN. Серое — свободно.",
@@ -487,7 +478,9 @@ class DdpTab(ttk.Frame):
 
         canvas_row = ttk.Frame(disk_wrap)
         canvas_row.pack(fill="both", expand=True)
-        self.disk_canvas = tk.Canvas(canvas_row, highlightthickness=0, background="#f8fafc")
+        self.disk_canvas = tk.Canvas(
+            canvas_row, highlightthickness=0, background="#f8fafc", height=200
+        )
         scrollbar = ttk.Scrollbar(canvas_row, orient="vertical", command=self.disk_canvas.yview)
         self.disk_canvas.configure(yscrollcommand=scrollbar.set)
         self.disk_canvas.pack(side="left", fill="both", expand=True)
@@ -497,6 +490,57 @@ class DdpTab(ttk.Frame):
             "<MouseWheel>",
             lambda e: self.disk_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
         )
+
+        lun_wrap = ttk.LabelFrame(self, text="LUN-ы", padding=6)
+        lun_wrap.pack(side="top", fill="both", expand=True, pady=(0, 8))
+        toolbar = ttk.Frame(lun_wrap)
+        toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Button(toolbar, text="+", width=3, command=self.add_lun).pack(side="left")
+        ttk.Label(toolbar, text="Добавить LUN").pack(side="left", padx=(6, 0))
+
+        lun_scroll = ttk.Frame(lun_wrap)
+        lun_scroll.pack(fill="both", expand=True)
+        self.lun_canvas = tk.Canvas(
+            lun_scroll, highlightthickness=0, background="#f8fafc", height=120
+        )
+        lun_scroll_bar = ttk.Scrollbar(
+            lun_scroll, orient="vertical", command=self.lun_canvas.yview
+        )
+        self.lun_canvas.configure(yscrollcommand=lun_scroll_bar.set)
+        self.lun_canvas.pack(side="left", fill="both", expand=True)
+        lun_scroll_bar.pack(side="right", fill="y")
+
+        self.luns_frame = ttk.Frame(self.lun_canvas)
+        self._lun_window = self.lun_canvas.create_window(
+            (0, 0), window=self.luns_frame, anchor="nw"
+        )
+        self.luns_frame.bind("<Configure>", lambda *_: self._sync_lun_scroll())
+        self.lun_canvas.bind("<Configure>", self._on_lun_canvas_configure)
+        self._bind_lun_mousewheel(lun_wrap)
+        lun_wrap.bind("<Enter>", self._lun_wheel_on)
+        lun_wrap.bind("<Leave>", self._lun_wheel_off)
+
+    def _sync_lun_scroll(self) -> None:
+        bbox = self.lun_canvas.bbox("all")
+        self.lun_canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
+
+    def _on_lun_canvas_configure(self, event: tk.Event) -> None:
+        self.lun_canvas.itemconfigure(self._lun_window, width=max(1, event.width))
+
+    def _on_lun_mousewheel(self, event: tk.Event) -> str:
+        self.lun_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _lun_wheel_on(self, _event: tk.Event | None = None) -> None:
+        self.lun_canvas.bind_all("<MouseWheel>", self._on_lun_mousewheel)
+
+    def _lun_wheel_off(self, _event: tk.Event | None = None) -> None:
+        self.lun_canvas.unbind_all("<MouseWheel>")
+
+    def _bind_lun_mousewheel(self, widget: tk.Misc) -> None:
+        widget.bind("<MouseWheel>", self._on_lun_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_lun_mousewheel(child)
 
     def disk_count(self) -> int:
         return max(0, parse_int(self.disk_count_var, 0))
@@ -509,6 +553,8 @@ class DdpTab(ttk.Frame):
             on_remove=self.remove_lun,
         )
         self.luns.append(row)
+        self._bind_lun_mousewheel(row.frame)
+        self._sync_lun_scroll()
         self.app.refresh()
 
     def remove_lun(self, row: LunRow) -> None:
@@ -517,6 +563,7 @@ class DdpTab(ttk.Frame):
             row.destroy()
             for i, r in enumerate(self.luns):
                 r.set_index(i)
+            self._sync_lun_scroll()
             self.app.refresh()
 
     def apply_limits_and_place(self, disk_bytes: int) -> tuple[list[list[Segment]], list[int], int, int]:
