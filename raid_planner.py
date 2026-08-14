@@ -74,6 +74,31 @@ def parse_float(var: tk.StringVar, default: float = 0.0) -> float:
         return default
 
 
+def parse_gb_text(text: str) -> float | None:
+    """Разобрать объём в ГБ из поля ввода. None — пустое или некорректное значение."""
+    s = str(text).strip().replace(",", ".")
+    for suffix in ("ГиБ", "GiB", "ГБ", "GB", "гб", "gb"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+            break
+    if not s:
+        return None
+    try:
+        value = float(s)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value != value or value == float("inf"):
+        return None
+    return value
+
+
+def format_gb_input(gb: float) -> str:
+    """Число ГБ для поля ввода: целое без дроби, иначе без хвостовых нулей."""
+    if abs(gb - round(gb)) < 1e-9:
+        return str(int(round(gb)))
+    return f"{gb:.3f}".rstrip("0").rstrip(".")
+
+
 def min_width(raid_type: str) -> int:
     rt = str(raid_type).strip().lower()
     if rt == "0":
@@ -159,6 +184,11 @@ def parity_kind(raid_type: str, index_in_stripe: int, width: int) -> str:
 
 
 def first_fit_disks(free: list[int], extent: int, width: int) -> list[int] | None:
+    """Подход 1: слева направо, первый набор дисков с достаточным остатком.
+
+    Уже занятые диски слева имеют приоритет: свободные справа берутся,
+    только когда слева не хватает места.
+    """
     if extent <= 0 or width <= 0:
         return None
     picked: list[int] = []
@@ -168,6 +198,33 @@ def first_fit_disks(free: list[int], extent: int, width: int) -> list[int] | Non
             if len(picked) == width:
                 return picked
     return None
+
+
+def free_first_disks(
+    free: list[int],
+    extent: int,
+    width: int,
+    segments: list[list[Segment]],
+) -> list[int] | None:
+    """Подход 2: сначала диски без страйпов, затем наименее заполненные.
+
+    «Свободный» диск — на нём ещё нет страйпов предыдущих LUN. Если таких
+    меньше, чем width, добираем уже занятые: больше свободного остатка
+    (меньше занято), при равенстве — меньший индекс (слева направо).
+    Итоговый набор сортируется по индексу диска, чтобы данные/чётность
+    шли в том же порядке, что и у подхода 1.
+    """
+    if extent <= 0 or width <= 0 or width > len(free):
+        return None
+    unused = [i for i, segs in enumerate(segments) if not segs and free[i] >= extent]
+    used = [i for i, segs in enumerate(segments) if segs and free[i] >= extent]
+    used.sort(key=lambda i: (-free[i], i))
+    chosen = unused + used
+    if len(chosen) < width:
+        return None
+    picked = chosen[:width]
+    picked.sort()
+    return picked
 
 
 def max_extent(free: list[int], width: int) -> int:
@@ -201,14 +258,30 @@ class LunSpec:
 
 
 def place_luns(disk_count: int, disk_bytes: int, luns: list[LunSpec]) -> tuple[list[list[Segment]], list[int]]:
-    """Разложить LUN-ы по дискам по порядку (first-fit). Свободное место — в хвосте."""
+    """Подход 1: first-fit слева направо. Новые LUN садятся на уже занятые диски."""
+    return _place_luns(disk_count, disk_bytes, luns, approach=1)
+
+
+def place_luns_free_first(
+    disk_count: int, disk_bytes: int, luns: list[LunSpec]
+) -> tuple[list[list[Segment]], list[int]]:
+    """Подход 2: каждый новый LUN сначала занимает ещё свободные диски группы."""
+    return _place_luns(disk_count, disk_bytes, luns, approach=2)
+
+
+def _place_luns(
+    disk_count: int, disk_bytes: int, luns: list[LunSpec], approach: int
+) -> tuple[list[list[Segment]], list[int]]:
     free = [disk_bytes] * disk_count
     segments: list[list[Segment]] = [[] for _ in range(disk_count)]
     for i, lun in enumerate(luns):
         ext = extent_bytes(lun.usable, lun.raid_type, lun.width)
         if ext <= 0:
             continue
-        chosen = first_fit_disks(free, ext, lun.width)
+        if approach == 2:
+            chosen = free_first_disks(free, ext, lun.width, segments)
+        else:
+            chosen = first_fit_disks(free, ext, lun.width)
         if chosen is None:
             continue
         for j, d in enumerate(chosen):
@@ -284,10 +357,6 @@ class LunRow:
         col += 1
         self.width_var.trace_add("write", lambda *_: self._on_width_change())
 
-        self.size_lbl = ttk.Label(self.frame, text="0 ГБ")
-        self.size_lbl.grid(row=0, column=col, sticky="w", padx=(0, 10))
-        col += 1
-
         try:
             free_bg = ttk.Style().lookup("TFrame", "background") or "SystemButtonFace"
         except tk.TclError:
@@ -307,20 +376,28 @@ class LunRow:
         col += 1
 
         self.frame.columnconfigure(col, weight=1)
-        col += 1
-
+        minus_col = col + 1
         ttk.Button(self.frame, text="−", width=3, command=lambda: self.on_remove(self)).grid(
-            row=0, column=col, padx=(8, 0), sticky="e"
+            row=0, column=minus_col, padx=(8, 0), sticky="e"
         )
 
+        # Размер: поле ГБ ↔ бегунок. size_var не привязан к Scale, чтобы можно было
+        # задать дробные ГБ текстом, не ломая resolution=1 у бегунка.
+        size_row = ttk.Frame(self.frame)
+        size_row.grid(row=1, column=0, columnspan=minus_col + 1, sticky="ew", pady=(0, 4))
         self.size_var = tk.DoubleVar(value=0.0)
+        self.size_entry_var = tk.StringVar(value="0")
+        self.size_entry = ttk.Entry(size_row, textvariable=self.size_entry_var, width=10)
+        self.size_entry.pack(side="left", padx=(0, 4))
+        ttk.Label(size_row, text="ГБ").pack(side="left", padx=(0, 6))
+        self.size_lbl = ttk.Label(size_row, text="(0.000 ТБ)")
+        self.size_lbl.pack(side="left", padx=(0, 8))
         self.scale = tk.Scale(
-            self.frame,
+            size_row,
             from_=0,
             to=1,
             resolution=1,
             orient=tk.HORIZONTAL,
-            variable=self.size_var,
             showvalue=False,
             length=400,
             width=14,
@@ -332,7 +409,11 @@ class LunRow:
             relief=tk.FLAT,
             command=lambda *_: self._on_slider(),
         )
-        self.scale.grid(row=1, column=0, columnspan=col + 1, sticky="ew", padx=(0, 8), pady=(0, 4))
+        self.scale.set(0)
+        self.scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.size_entry_var.trace_add("write", lambda *_: self._on_size_entry())
+        self.size_entry.bind("<FocusOut>", self._on_size_entry_focus_out)
+        self.size_entry.bind("<Return>", self._on_size_entry_focus_out)
 
     def set_index(self, index: int) -> None:
         self.color = LUN_PALETTE[index % len(LUN_PALETTE)]
@@ -373,9 +454,18 @@ class LunRow:
             self.scale.configure(to=to_val)
             if cur > max_gb:
                 self.size_var.set(max_gb)
+                self.scale.set(max_gb)
+                self._write_size_entry(max_gb)
+            else:
+                self.scale.set(cur)
         finally:
             self._updating = False
         self._refresh_size_label()
+
+    def _write_size_entry(self, gb: float) -> None:
+        text = format_gb_input(gb)
+        if self.size_entry_var.get() != text:
+            self.size_entry_var.set(text)
 
     def _refresh_size_label(self) -> None:
         gb = float(self.size_var.get())
@@ -385,7 +475,7 @@ class LunRow:
         ext = extent_bytes(usable, rt, w)
         n_data = data_disks(rt, w)
         self.size_lbl.configure(
-            text=f"{format_gb_tb(usable)}  ×{n_data} по {format_tb(ext)} ТБ"
+            text=f"({format_tb(usable)} ТБ)  ×{n_data} по {format_tb(ext)} ТБ"
         )
         remain = max(0, int(self._max_gb * GB) - usable)
         self.free_lbl.configure(text=f"ещё {format_tb(remain)} ТБ")
@@ -421,14 +511,72 @@ class LunRow:
     def _on_slider(self) -> None:
         if self._updating:
             return
-        if self._max_gb > 0 and float(self.size_var.get()) > self._max_gb:
-            self._updating = True
-            try:
-                self.size_var.set(self._max_gb)
-            finally:
-                self._updating = False
+        gb = float(self.scale.get())
+        if self._max_gb > 0 and gb > self._max_gb:
+            gb = self._max_gb
+        cur = float(self.size_var.get())
+        if abs(gb - cur) < 1e-9 and format_gb_input(gb) == self.size_entry_var.get():
+            self._refresh_size_label()
+            return
+        self._updating = True
+        try:
+            if abs(gb - cur) >= 1e-9:
+                self.size_var.set(gb)
+            if abs(float(self.scale.get()) - gb) >= 1e-9:
+                self.scale.set(gb)
+            self._write_size_entry(gb)
+        finally:
+            self._updating = False
         self._refresh_size_label()
         self._notify()
+
+    def _on_size_entry(self, *_args: object) -> None:
+        if self._updating:
+            return
+        parsed = parse_gb_text(self.size_entry_var.get())
+        if parsed is None:
+            return
+        if self._max_gb > 0:
+            parsed = min(parsed, self._max_gb)
+        parsed = max(0.0, parsed)
+        cur = float(self.size_var.get())
+        slider = float(self.scale.get())
+        if abs(parsed - cur) < 1e-9 and abs(slider - parsed) < 1e-9:
+            return
+        self._updating = True
+        try:
+            if abs(parsed - cur) >= 1e-9:
+                self.size_var.set(parsed)
+            if abs(slider - parsed) >= 1e-9:
+                self.scale.set(parsed)
+        finally:
+            self._updating = False
+        self._refresh_size_label()
+        self._notify()
+
+    def _on_size_entry_focus_out(self, *_args: object) -> None:
+        if self._updating:
+            return
+        parsed = parse_gb_text(self.size_entry_var.get())
+        gb = float(self.size_var.get())
+        if parsed is not None:
+            if self._max_gb > 0:
+                parsed = min(parsed, self._max_gb)
+            gb = max(0.0, parsed)
+            if abs(gb - float(self.size_var.get())) >= 1e-9:
+                self._updating = True
+                try:
+                    self.size_var.set(gb)
+                    self.scale.set(gb)
+                finally:
+                    self._updating = False
+                self._refresh_size_label()
+                self._notify()
+        self._updating = True
+        try:
+            self._write_size_entry(gb)
+        finally:
+            self._updating = False
 
     def _notify(self) -> None:
         if not self._updating:
@@ -448,9 +596,11 @@ class DdpTab(ttk.Frame):
         self.luns: list[LunRow] = []
         self._last_segments: list[list[Segment]] = []
         self._last_free: list[int] = []
+        self._last_segments_a2: list[list[Segment]] = []
+        self._last_free_a2: list[int] = []
         self._last_usable = 0
         self._last_parity = 0
-        self._drawing = False
+        self._drawing_canvases: set[int] = set()
         self.disk_count_var = tk.StringVar(value="5")
         self.disk_count_var.trace_add("write", lambda *_: self.app.refresh())
 
@@ -476,19 +626,21 @@ class DdpTab(ttk.Frame):
         )
         legend.pack(anchor="w", pady=(0, 4))
 
-        canvas_row = ttk.Frame(disk_wrap)
-        canvas_row.pack(fill="both", expand=True)
-        self.disk_canvas = tk.Canvas(
-            canvas_row, highlightthickness=0, background="#f8fafc", height=200
-        )
-        scrollbar = ttk.Scrollbar(canvas_row, orient="vertical", command=self.disk_canvas.yview)
-        self.disk_canvas.configure(yscrollcommand=scrollbar.set)
-        self.disk_canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.disk_canvas.bind("<Configure>", lambda *_: self.redraw_disks(use_cache=True))
+        self.approach_nb = ttk.Notebook(disk_wrap)
+        self.approach_nb.pack(fill="both", expand=True)
+        approach1 = ttk.Frame(self.approach_nb, padding=2)
+        approach2 = ttk.Frame(self.approach_nb, padding=2)
+        self.approach_nb.add(approach1, text="Подход 1")
+        self.approach_nb.add(approach2, text="Подход 2")
+        self.disk_canvas = self._make_disk_canvas(approach1)
+        self.disk_canvas_a2 = self._make_disk_canvas(approach2)
         self.disk_canvas.bind(
-            "<MouseWheel>",
-            lambda e: self.disk_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
+            "<Configure>",
+            lambda *_: self._redraw_one(self.disk_canvas, self._last_segments, self._last_free),
+        )
+        self.disk_canvas_a2.bind(
+            "<Configure>",
+            lambda *_: self._redraw_one(self.disk_canvas_a2, self._last_segments_a2, self._last_free_a2),
         )
 
         lun_wrap = ttk.LabelFrame(self, text="LUN-ы", padding=6)
@@ -541,6 +693,20 @@ class DdpTab(ttk.Frame):
         widget.bind("<MouseWheel>", self._on_lun_mousewheel)
         for child in widget.winfo_children():
             self._bind_lun_mousewheel(child)
+
+    def _make_disk_canvas(self, parent: ttk.Frame) -> tk.Canvas:
+        row = ttk.Frame(parent)
+        row.pack(fill="both", expand=True)
+        canvas = tk.Canvas(row, highlightthickness=0, background="#f8fafc", height=200)
+        scrollbar = ttk.Scrollbar(row, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        canvas.bind(
+            "<MouseWheel>",
+            lambda e, c=canvas: c.yview_scroll(int(-1 * (e.delta / 120)), "units"),
+        )
+        return canvas
 
     def disk_count(self) -> int:
         return max(0, parse_int(self.disk_count_var, 0))
@@ -607,8 +773,11 @@ class DdpTab(ttk.Frame):
             placed.append(spec)
 
         segments, free_after = place_luns(n, disk_bytes, placed)
+        segments_a2, free_a2 = place_luns_free_first(n, disk_bytes, placed)
         self._last_usable = total_usable
         self._last_parity = total_parity
+        self._last_segments_a2 = segments_a2
+        self._last_free_a2 = free_a2
         return segments, free_after, total_usable, total_parity
 
     def redraw_disks(
@@ -617,8 +786,6 @@ class DdpTab(ttk.Frame):
         free: list[int] | None = None,
         use_cache: bool = False,
     ) -> None:
-        if self._drawing:
-            return
         n = self.disk_count()
         disk_bytes = self.app.disk_bytes()
         if use_cache:
@@ -630,67 +797,84 @@ class DdpTab(ttk.Frame):
             free = [disk_bytes] * n
         self._last_segments = segments
         self._last_free = free
+        self._redraw_one(self.disk_canvas, self._last_segments, self._last_free)
+        self._redraw_one(self.disk_canvas_a2, self._last_segments_a2, self._last_free_a2)
 
-        self._drawing = True
-        canvas = self.disk_canvas
-        canvas.delete("all")
-
-        width = max(200, int(canvas.winfo_width()) - 8)
-        label_w = 36
-        used_w = 130
-        bar_x = label_w + 8
-        bar_w = max(80, width - bar_x - used_w - 12)
-        row_h = 28
-        pad_y = 6
-        bar_h = 20
-
-        if n == 0 or disk_bytes <= 0:
-            canvas.create_text(12, 16, anchor="w", text="Укажите число дисков в группе и объём диска в пуле.")
-            canvas.configure(scrollregion=(0, 0, width, 40))
-            self._drawing = False
+    def _redraw_one(
+        self,
+        canvas: tk.Canvas,
+        segments: list[list[Segment]],
+        free: list[int],
+    ) -> None:
+        canvas_id = id(canvas)
+        if canvas_id in self._drawing_canvases:
             return
+        n = self.disk_count()
+        disk_bytes = self.app.disk_bytes()
+        self._drawing_canvases.add(canvas_id)
+        try:
+            canvas.delete("all")
 
-        for i in range(n):
-            y = pad_y + i * row_h
-            canvas.create_text(label_w, y + bar_h / 2, text=f"#{i + 1}", anchor="e", font=("Segoe UI", 10, "bold"))
-            x0, y0 = bar_x, y
-            x1, y1 = bar_x + bar_w, y + bar_h
-            canvas.create_rectangle(x0, y0, x1, y1, fill="#e5e7eb", outline="#9ca3af")
-            x = x0
-            for seg in segments[i] if i < len(segments) else []:
-                w = bar_w * seg.size / disk_bytes
-                if w < 1:
-                    w = 1
-                canvas.create_rectangle(
-                    x,
-                    y0,
-                    x + w,
-                    y1,
-                    fill=seg.color,
-                    outline="#1f2937",
-                    stipple=stipple_for(seg.parity_kind),
+            width = max(200, int(canvas.winfo_width()) - 8)
+            label_w = 36
+            used_w = 130
+            bar_x = label_w + 8
+            bar_w = max(80, width - bar_x - used_w - 12)
+            row_h = 28
+            pad_y = 6
+            bar_h = 20
+
+            if n == 0 or disk_bytes <= 0:
+                canvas.create_text(
+                    12, 16, anchor="w", text="Укажите число дисков в группе и объём диска в пуле."
                 )
-                if w >= 22:
-                    label = seg.parity_kind if seg.parity_kind else seg.name.replace("LUN", "L")
-                    canvas.create_text(
-                        x + w / 2,
-                        y0 + bar_h / 2,
-                        text=label,
-                        fill="white",
-                        font=("Segoe UI", 8, "bold"),
-                    )
-                x += w
-            used = disk_bytes - (free[i] if i < len(free) else 0)
-            canvas.create_text(
-                x1 + 8,
-                y0 + bar_h / 2,
-                text=f"{format_tb(used)} / {format_tb(disk_bytes)} ТБ",
-                anchor="w",
-                font=("Segoe UI", 8),
-            )
+                canvas.configure(scrollregion=(0, 0, width, 40))
+                return
 
-        canvas.configure(scrollregion=(0, 0, width, pad_y + n * row_h + 8))
-        self._drawing = False
+            for i in range(n):
+                y = pad_y + i * row_h
+                canvas.create_text(
+                    label_w, y + bar_h / 2, text=f"#{i + 1}", anchor="e", font=("Segoe UI", 10, "bold")
+                )
+                x0, y0 = bar_x, y
+                x1, y1 = bar_x + bar_w, y + bar_h
+                canvas.create_rectangle(x0, y0, x1, y1, fill="#e5e7eb", outline="#9ca3af")
+                x = x0
+                for seg in segments[i] if i < len(segments) else []:
+                    w = bar_w * seg.size / disk_bytes
+                    if w < 1:
+                        w = 1
+                    canvas.create_rectangle(
+                        x,
+                        y0,
+                        x + w,
+                        y1,
+                        fill=seg.color,
+                        outline="#1f2937",
+                        stipple=stipple_for(seg.parity_kind),
+                    )
+                    if w >= 22:
+                        label = seg.parity_kind if seg.parity_kind else seg.name.replace("LUN", "L")
+                        canvas.create_text(
+                            x + w / 2,
+                            y0 + bar_h / 2,
+                            text=label,
+                            fill="white",
+                            font=("Segoe UI", 8, "bold"),
+                        )
+                    x += w
+                used = disk_bytes - (free[i] if i < len(free) else 0)
+                canvas.create_text(
+                    x1 + 8,
+                    y0 + bar_h / 2,
+                    text=f"{format_tb(used)} / {format_tb(disk_bytes)} ТБ",
+                    anchor="w",
+                    font=("Segoe UI", 8),
+                )
+
+            canvas.configure(scrollregion=(0, 0, width, pad_y + n * row_h + 8))
+        finally:
+            self._drawing_canvases.discard(canvas_id)
 
     def set_group_info(self, used: int, usable: int, parity: int) -> None:
         n = self.disk_count()
@@ -721,6 +905,25 @@ def _html_disk_bar(segments: list[Segment], free: int, disk_bytes: int) -> str:
         pct = 100.0 * free / disk_bytes
         parts.append(f'<div class="seg free" style="width:{pct:.4f}%;" title="свободно"></div>')
     return "".join(parts)
+
+
+def _html_disk_rows(
+    n: int, segs: list[list[Segment]], free: list[int], disk_bytes: int
+) -> str:
+    disk_rows: list[str] = []
+    for i in range(n):
+        disk_segs = segs[i] if i < len(segs) else []
+        disk_free = free[i] if i < len(free) else disk_bytes
+        used = disk_bytes - disk_free
+        disk_rows.append(
+            "<div class='disk'>"
+            f"<div class='dnum'>#{i + 1}</div>"
+            f"<div class='bar'>{_html_disk_bar(disk_segs, disk_free, disk_bytes)}</div>"
+            f"<div class='dused'>{format_gb(used)} / {format_gb(disk_bytes)} ГБ"
+            f"  ({format_tb(used)} / {format_tb(disk_bytes)} ТБ)</div>"
+            "</div>"
+        )
+    return "".join(disk_rows)
 
 
 def build_html_report(app: "RaidPlannerApp") -> str:
@@ -756,19 +959,8 @@ def build_html_report(app: "RaidPlannerApp") -> str:
                 f"<td>{data_disks(spec.raid_type, spec.width)} / {parity_disks(spec.raid_type, spec.width)}</td>"
                 "</tr>"
             )
-        disk_rows = []
-        for i in range(n):
-            disk_segs = segs[i] if i < len(segs) else []
-            disk_free = free[i] if i < len(free) else disk_bytes
-            used = disk_bytes - disk_free
-            disk_rows.append(
-                "<div class='disk'>"
-                f"<div class='dnum'>#{i + 1}</div>"
-                f"<div class='bar'>{_html_disk_bar(disk_segs, disk_free, disk_bytes)}</div>"
-                f"<div class='dused'>{format_gb(used)} / {format_gb(disk_bytes)} ГБ"
-                f"  ({format_tb(used)} / {format_tb(disk_bytes)} ТБ)</div>"
-                "</div>"
-            )
+        segs_a2 = tab._last_segments_a2
+        free_a2 = tab._last_free_a2
         sections.append(
             f"<section><h2>{html.escape(tab.title)}</h2>"
             f"<p>Дисков: {n}. Занято сырого: {format_gb_tb(used_raw)}. "
@@ -777,7 +969,13 @@ def build_html_report(app: "RaidPlannerApp") -> str:
             "<th>Полезная нагрузка</th><th>Страйп</th><th>Данные / чётность</th></tr></thead><tbody>"
             + ("".join(lun_rows) if lun_rows else "<tr><td colspan='6'>Нет LUN-ов</td></tr>")
             + "</tbody></table>"
-            "<div class='disks'>" + "".join(disk_rows) + "</div></section>"
+            "<h3>Подход 1</h3>"
+            "<p class='hint-inline'>Упаковка в уже занятые диски (first-fit слева направо).</p>"
+            "<div class='disks'>" + _html_disk_rows(n, segs, free, disk_bytes) + "</div>"
+            "<h3>Подход 2</h3>"
+            "<p class='hint-inline'>Сначала ещё свободные диски группы, затем наименее заполненные.</p>"
+            "<div class='disks'>" + _html_disk_rows(n, segs_a2, free_a2, disk_bytes) + "</div>"
+            "</section>"
         )
 
     body = "\n".join(sections) if sections else "<p>Нет групп.</p>"
@@ -812,6 +1010,8 @@ def build_html_report(app: "RaidPlannerApp") -> str:
     );
   }}
   .hint {{ margin-top: 32px; color: #64748b; font-size: 13px; }}
+  .hint-inline {{ color: #64748b; font-size: 13px; margin: 0 0 8px; }}
+  h3 {{ margin: 16px 0 4px; font-size: 15px; }}
   @media print {{
     body {{ margin: 12px; }}
     .hint {{ display: none; }}
